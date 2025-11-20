@@ -13,11 +13,24 @@ suppressPackageStartupMessages({
 })
 
 tidymodels_prefer()
-source("R/data_functions.R")
+source("./R/data_functions.R")
+
+# ---------------
+library(doFuture)
+library(future)
+
+n_cores=parallel::detectCores() - 1
+#registerDoFuture()
+#plan(multisession, workers = n_cores)
+
+message(glue("Parallel processing enabled with {n_cores} cores."))
+#-----------
+
 
 # ------------------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------------------
+cfg_debug = 1
 cfg_data_path     <- "./data/mdata.species.clr_all.csv"
 cfg_id_col        <- "Digester"
 cfg_time_col      <- "Sample_Date"
@@ -30,9 +43,19 @@ cfg_forecast_horizons   <- c(1, 7, 14, 21)
 cfg_assess_width_days   <- 14
 cfg_lookback_days       <- 56
 cfg_summary_window      <- 6   # feature rolling window
-cfg_holdout_samples     <- 8L  # final samples held out
-cfg_feature_sets_to_use <- c("fs_S", "fs_M")
-cfg_debug_nsplits       <- 5   # Inf for all
+cfg_holdout_samples     <- 10  # final samples held out
+cfg_feature_sets_to_use <- c("fs_P", "fs_S", "fs_Mcomm", "fs_SPM", "fs_SP")
+if(cfg_debug)
+  cfg_feature_sets_to_use = c("fs_P")
+cfg_debug_nsplits       <- ifelse(cfg_debug, 5, Inf)   # Inf for all
+
+#model tuning
+cfg_models_subset <- character()
+if(cfg_debug)
+  cfg_models_subset <- c(str_c(cfg_feature_sets_to_use, "_lasso"), "arima_arima", "lastval_lastobs")
+cfg_pls_levels = ifelse(cfg_debug, 3, 5)
+cfg_lasso_levels = ifelse(cfg_debug, 3, 7)
+
 
 # ------------------------------------------------------------------------------
 # Data Loading & Feature Definitions
@@ -47,15 +70,17 @@ microbial_otu_cols <- grep("_otu$", names(df_raw), value = TRUE)
 microbial_comm_cols <- c("su__sugar_degraders_fermenters", "aa__amino_acid_degraders", "c4__butyrate_and_valerate_degraders",
                          "fa__long_chain_fatty_acid_degraders", "pro__propionate_degraders", "ac__acetoclastic_methanogens",
                          "h2__hydrogenotrophic_methanogens")
-diversity_cols <- c("uniqueOTUs", "Shannon", "Simpson", "invSimpson", "PielouEvenness", "Soerensen", "SoerensenAD1AD2",
-                    "BrayCurtisAD1AD2", "JaccardAD1AD2", "Rolling_Jaccard6days", "Rolling_Bray6days",
-                    "Rate_of_change_Jaccard_per_day", "Rate_of_change_Bray_per_day")
+microbial_diversity_cols <- c("uniqueOTUs", "Shannon", "Simpson", "invSimpson", "PielouEvenness", "Soerensen", "SoerensenAD1AD2",
+                              "BrayCurtisAD1AD2", "JaccardAD1AD2", "Rolling_Jaccard6days", "Rolling_Bray6days",
+                              "Rate_of_change_Jaccard_per_day", "Rate_of_change_Bray_per_day")
 
 cfg_feature_sets <- list(
   fs_S   = seasonal_cols,
-  fs_M   = c(microbial_otu_cols, microbial_comm_cols, diversity_cols),
+  fs_Mcomm   = c( microbial_comm_cols),
+  fs_Mdiv   = c( microbial_diversity_cols),
+  fs_M   = c(microbial_otu_cols, microbial_comm_cols, microbial_diversity_cols),
   fs_SP  = union(seasonal_cols, process_cols),
-  fs_SPM = union(seasonal_cols, union(process_cols, c(microbial_otu_cols, microbial_comm_cols, diversity_cols))),
+  fs_SPM = union(seasonal_cols, union(process_cols, c(microbial_comm_cols, microbial_diversity_cols))),
   fs_P   = process_cols
 )
 feature_sets <- cfg_feature_sets[cfg_feature_sets_to_use]
@@ -101,45 +126,49 @@ for(h in cfg_forecast_horizons) {
 # ------------------------------------------------------------------------------
 # Model Specifications
 # ------------------------------------------------------------------------------
-# Shared specs
-lm_spec <- parsnip::linear_reg() %>% set_engine("lm")
-lasso_spec <- parsnip::linear_reg(penalty = tune(), mixture = 1) %>% set_engine("glmnet")
-lasso_grid <- grid_regular(penalty(range = c(-3, 0), trans = scales::log10_trans()), levels = 7)
+make_model_specs <- function() {
+  list(
+    lm = parsnip::linear_reg() %>% set_engine("lm"),
+    lasso = parsnip::linear_reg(penalty = tune(), mixture = 1) %>% set_engine("glmnet"),
+    pls = parsnip::pls(mode = "regression", num_comp = tune(), predictor_prop = tune()) %>% set_engine("mixOmics"),
+    arima = modeltime::arima_reg() %>% set_engine("auto_arima"),
+    lastobs = parsnip::linear_reg() %>% set_engine("lm")
+  )
+}
 
-pls_spec <- parsnip::pls(mode = "regression", num_comp = tune(), predictor_prop = tune()) %>% set_engine("mixOmics")
-pls_grid <- grid_space_filling(num_comp(range = c(1L, 6L)), predictor_prop(range = c(0.2, 1)), size = 10)
-
-arima_spec <- modeltime::arima_reg() %>% set_engine("auto_arima")
+lasso_grid <- grid_regular(penalty(range = c(-3, 0), trans = scales::log10_trans()), levels = cfg_lasso_levels)
+pls_grid <- grid_space_filling(num_comp(range = c(1L, 6L)), predictor_prop(range = c(0.2, 1)), size = cfg_pls_levels)
+model_specs <- make_model_specs()
 
 # ------------------------------------------------------------------------------
 # 1. Define Base Recipes (OUTSIDE LOOP)
 # ------------------------------------------------------------------------------
 # We use 'df_master' to establish column names and types.
 # We do NOT set an outcome yet.
-base_recipes <- sapply(names(feature_sets), function(x) {
+base_recipes <- sapply(feature_sets, function(fs_cols) {
 
   recipes::recipe(df_master) %>%
     # 1. Assign roles manually (No formula used)
     recipes::update_role(!!sym(cfg_time_col), new_role = "time_index") %>%
     recipes::update_role(!!sym(cfg_id_col), new_role = "id") %>%
-    recipes::update_role(all_of(feature_sets[[x]]), new_role = "predictor") %>%
+    recipes::update_role(all_of(fs_cols), new_role = "predictor") %>%
 
     # 2. Feature Engineering (Identical for all horizons)
     timetk::step_timeseries_signature(!!sym(cfg_time_col)) %>%
     timetk::step_fourier(!!sym(cfg_time_col), period = 7, K = 1) %>%
-    recipes::step_lag(all_of(feature_sets[[x]]), lag = c(1, 3, 7, 14)) %>%
+    recipes::step_lag(all_of(fs_cols), lag = c(1, 3, 7, 14)) %>%
 
     # Rolling features
     timetk::step_slidify_augment(
-      all_of(feature_sets[[x]]), period = cfg_summary_window, .f = ~mean(.x, na.rm=TRUE),
+      all_of(fs_cols), period = cfg_summary_window, .f = ~mean(.x, na.rm=TRUE),
       align = "right", partial = TRUE, prefix = glue("roll{cfg_summary_window}_mean_")
     ) %>%
     timetk::step_slidify_augment(
-      all_of(feature_sets[[x]]), period = cfg_summary_window, .f = ~sd(.x, na.rm=TRUE),
+      all_of(fs_cols), period = cfg_summary_window, .f = ~sd(.x, na.rm=TRUE),
       align = "right", partial = TRUE, prefix = glue("roll{cfg_summary_window}_sd_")
     ) %>%
     timetk::step_slidify_augment(
-      all_of(feature_sets[[x]]), period = cfg_summary_window,
+      all_of(fs_cols), period = cfg_summary_window,
       .f = ~{val<-suppressWarnings(max(.x, na.rm=TRUE)); if(is.finite(val)) val else NA_real_},
       align = "right", partial = TRUE, prefix = glue("roll{cfg_summary_window}_max_")
     ) %>%
@@ -154,34 +183,24 @@ base_recipes <- sapply(names(feature_sets), function(x) {
 
 }, simplify = FALSE, USE.NAMES = TRUE)
 
-# extract_best_and_predict:
-# Takes a row from a workflow_set, finalizes it, fits on Train, predicts Test
-fit_and_predict_holdout <- function(wflow_id, result, workflow, train_data, test_data) {
+# ------------------------------------------------------------------------------
+# Baseline Recipe Helpers
+# ------------------------------------------------------------------------------
+make_arima_recipe <- function(df_train, target, time_col, id_col) {
+  recipes::recipe(stats::as.formula(sprintf("%s ~ %s + %s", target, time_col, id_col)), data = df_train) %>%
+    recipes::update_role(!!rlang::sym(target), new_role = "outcome") %>%
+    recipes::update_role(!!rlang::sym(id_col), new_role = "id") %>%
+    recipes::add_role(!!rlang::sym(time_col), new_role = "time_index") %>%
+    recipes::step_naomit(recipes::all_outcomes())
+}
 
-  if(nrow(test_data) == 0) return(tibble())
-
-  # 1. Determine Best Configuration (if tunable) or just use the workflow (if not)
-  # Note: 'result' is the tuning result object
-  best_config <- tryCatch(select_best(result, metric = "rmse"), error = function(e) NULL)
-
-  final_wf <- if (!is.null(best_config)) {
-    finalize_workflow(workflow, best_config)
-  } else {
-    workflow
-  }
-
-  # 2. Fit on ALL training data
-  fit_final <- parsnip::fit(final_wf, data = train_data)
-
-  # 3. Predict on Holdout
-  preds <- predict(fit_final, new_data = test_data)
-
-  # 4. Bind with ID/Date/Truth
-  bind_cols(
-    test_data %>% select(any_of(c("Digester", "Sample_Date", ".y_target"))),
-    preds
-  ) %>%
-    mutate(model = wflow_id)
+make_lastval_recipe <- function(df_train, target, time_col, id_col) {
+  recipes::recipe(stats::as.formula(sprintf("%s ~ target_last_value + %s + %s", target, time_col, id_col)), data = df_train) %>%
+    recipes::update_role(!!rlang::sym(target), new_role = "outcome") %>%
+    recipes::update_role(target_last_value, new_role = "predictor") %>%
+    recipes::update_role(!!rlang::sym(time_col), new_role = "time_index") %>%
+    recipes::update_role(!!rlang::sym(id_col), new_role = "id") %>%
+    recipes::step_naomit(recipes::all_outcomes())
 }
 
 # ------------------------------------------------------------------------------
@@ -222,8 +241,14 @@ for (h in cfg_forecast_horizons) {
     step = 1, complete = TRUE
   )
 
+  # If we've turned on the debugging flag, then only use a subset of the time data for
+  # training and evaluation purposes.
+  # NB: I'm not actually sure this saves all that much time but I'm doing it anyway
   if(cfg_debug_nsplits < nrow(resamples_sliding)) {
+    resamples_class <- class(resamples_sliding)
     resamples_sliding <- resamples_sliding[1:cfg_debug_nsplits, ]
+    class(resamples_sliding) <- resamples_class
+
   }
 
   # --- 2. Recipe Finalization ---
@@ -235,53 +260,31 @@ for (h in cfg_forecast_horizons) {
           recipes::step_naomit(all_outcomes())
     )
 
-  # B. The Baseline Recipes (Created specifically for this target)
-  # ARIMA: Needs Date + Outcome only
-  rec_arima <- recipe(df_train) %>%
-    update_role(!!sym(cfg_time_col), new_role = "time_index") %>%
-    update_role(!!sym(curr_target), new_role = "outcome") %>%
-    step_naomit(all_outcomes())
+  rec_arima <- make_arima_recipe(df_train, curr_target, cfg_time_col, cfg_id_col)
+  rec_last <- make_lastval_recipe(df_train, curr_target, cfg_time_col, cfg_id_col)
+  recipes_for_workflows <- c(recs_ml, list(lastval = rec_last, arima = rec_arima))
 
-  # Last Value: Needs LastVal + Outcome + ID/Date
-  rec_last <- recipe(df_train) %>%
-    update_role(!!sym(curr_target), new_role = "outcome") %>%
-    update_role(target_last_value, new_role = "predictor") %>%
-    update_role(!!sym(cfg_time_col), new_role = "time_index") %>%
-    update_role(!!sym(cfg_id_col), new_role = "id") %>%
-    step_impute_mean(all_predictors())
+  # --- 3. Build Unified Workflow Set -----------
+  all_workflows <- workflow_set(
+    preproc = recipes_for_workflows,
+    models = model_specs,
+    cross = TRUE
+  ) %>%
+    filter(
+      !(grepl("^arima_", wflow_id)   & !grepl("_arima$", wflow_id)),
+      !(grepl("_arima$", wflow_id)   & !grepl("^arima_", wflow_id)),
+      !(grepl("^lastval_", wflow_id) & !grepl("_lastobs$", wflow_id)),
+      !(grepl("_lastobs$", wflow_id) & !grepl("^lastval_", wflow_id))
+    ) %>%
+    add_tune_grid_to_workflows("lasso", lasso_grid) %>%
+    add_tune_grid_to_workflows("pls", pls_grid)
 
-  # --- 3. Build Unified Workflow Set ---
-
-  # We construct the set in blocks to ensure correct pairings
-  # Block 1: ML Models (All ML Recipes x LM, Lasso, PLS)
-  wset_ml <- workflow_set(
-    preproc = recs_ml,
-    models  = list(lm = lm_spec, lasso = lasso_spec, pls = pls_spec),
-    cross   = TRUE
-  )
-
-  # Block 2: ARIMA (ARIMA Recipe x ARIMA Spec)
-  wset_arima <- workflow_set(
-    preproc = list(simple = rec_arima),
-    models  = list(arima = arima_spec),
-    cross   = TRUE
-  )
-
-  # Block 3: Last Value (LastVal Recipe x LM Spec)
-  wset_last <- workflow_set(
-    preproc = list(baseline = rec_last),
-    models  = list(lastobs = lm_spec),
-    cross   = TRUE
-  )
-
-  # Combine and configure grids
-  all_workflows <- bind_rows(wset_ml, wset_arima, wset_last) %>%
-    # Attach specific grids to specific model types using Regex on wflow_id
-    option_add(grid = lasso_grid, id = "lasso") %>%
-    option_add(grid = pls_grid,   id = "pls")
-
-  # --- 4. Execute (The "One Ring" Rule) ---
+  # --- 4. Execute the workfllows -----------
   # workflow_map handles standard resampling (LM/ARIMA) AND tuning (Lasso/PLS) simultaneously
+
+  #If debugging, we may only want to run a subset of models
+  if(exists("cfg_models_subset") && length(cfg_models_subset))
+    all_workflows <- all_workflows %>% filter(wflow_id %in% cfg_models_subset)
 
   message("   -> Fitting all models...")
   results_master <- all_workflows %>%
@@ -293,7 +296,7 @@ for (h in cfg_forecast_horizons) {
       verbose = TRUE
     )
 
-  # --- 5. Extract Results (Operating on the Master Object) ---
+  # --- 5. Extract Results  ---
 
   # A. Tuning Logs (Detailed candidates)
   horizon_log <- results_master %>%

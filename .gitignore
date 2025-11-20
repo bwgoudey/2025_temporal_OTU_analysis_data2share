@@ -26,3 +26,5 @@ renv/staging/
 *.log
 *.tmp
 *.bak
+
+.Rproj.user/shared/notebooks/paths

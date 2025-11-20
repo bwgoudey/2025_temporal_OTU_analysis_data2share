@@ -20,8 +20,8 @@ library(doFuture)
 library(future)
 
 n_cores=parallel::detectCores() - 1
-#registerDoFuture()
-#plan(multisession, workers = n_cores)
+registerDoFuture()
+plan(multisession, workers = n_cores)
 
 message(glue("Parallel processing enabled with {n_cores} cores."))
 #-----------
@@ -30,7 +30,7 @@ message(glue("Parallel processing enabled with {n_cores} cores."))
 # ------------------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------------------
-cfg_debug = 1
+cfg_debug = 0
 cfg_data_path     <- "./data/mdata.species.clr_all.csv"
 cfg_id_col        <- "Digester"
 cfg_time_col      <- "Sample_Date"
@@ -208,6 +208,7 @@ make_lastval_recipe <- function(df_train, target, time_col, id_col) {
 # ------------------------------------------------------------------------------
 all_metrics_list <- list()
 all_holdout_preds <- list()
+all_assessment_preds <- list()
 all_tuning_logs <- list()
 
 message(glue("Starting forecast loop. Horizons: {paste(cfg_forecast_horizons, collapse=', ')}"))
@@ -225,6 +226,7 @@ for (h in cfg_forecast_horizons) {
   # Split
   df_h <- df_h %>%
     arrange(.data[[cfg_id_col]], .data[[cfg_time_col]]) %>%
+    mutate(.row_id = row_number()) %>%
     group_by(.data[[cfg_id_col]]) %>%
     mutate(is_holdout = row_number() > pmax(n() - cfg_holdout_samples, 0L)) %>%
     ungroup()
@@ -320,7 +322,22 @@ for (h in cfg_forecast_horizons) {
     unnest(best_metrics) %>%
     mutate(horizon = h, data_role = "assessment")
 
-  # C. Holdout Predictions
+  # C. Assessment Predictions (per resample)
+  horizon_assessment_preds <- results_master %>%
+    mutate(preds = map(result, ~collect_predictions(.x, summarize = FALSE))) %>%
+    select(model = wflow_id, preds) %>%
+    unnest(preds) %>%
+    mutate(horizon = h, data_role = "assessment") %>%
+    rename(.row_id = .row) %>%
+    left_join(
+      df_train %>% select(.row_id, !!sym(cfg_time_col), !!sym(cfg_id_col), .y_target),
+      by = ".row_id"
+    ) %>%
+    select(-.row_id)
+
+  all_assessment_preds[[as.character(h)]] <- horizon_assessment_preds
+
+  # D. Holdout Predictions
   message("   -> Predicting holdout...")
 
   horizon_holdout <- results_master %>%
@@ -329,7 +346,7 @@ for (h in cfg_forecast_horizons) {
     })) %>%
     select(preds) %>%
     unnest(preds) %>%
-    mutate(horizon = h)
+    mutate(horizon = h, data_role = "holdout")
 
   # Calculate metrics for holdout
   if(nrow(horizon_holdout) > 0) {
@@ -350,11 +367,12 @@ for (h in cfg_forecast_horizons) {
 # Aggregation and Saving
 # ------------------------------------------------------------------------------
 final_metrics <- bind_rows(all_metrics_list)
-final_preds   <- bind_rows(all_holdout_preds)
+final_holdout_preds   <- bind_rows(all_holdout_preds)
+final_assessment_preds <- bind_rows(all_assessment_preds)
 final_logs    <- bind_rows(all_tuning_logs)
 
 write_csv(final_metrics, "outputs/tables/summary_metrics_all_horizons.csv")
-write_csv(final_preds, "outputs/tables/holdout_predictions.csv")
+write_csv(final_holdout_preds, "outputs/tables/holdout_predictions.csv")
 # Detailed tuning results for every fold, every parameter candidate, every horizon
 write_csv(final_logs, "outputs/tables/full_tuning_results_log.csv")
 
@@ -373,20 +391,32 @@ final_metrics %>%
 
 # 2. Performance by Horizon
 final_metrics %>%
-  filter(.metric == "rmse", data_role == "assessment") %>%
+  filter(!grepl("_lm", model)) %>%
+  filter(.metric == "rmse") %>%
   ggplot(aes(x = model, y = .estimate, colour = model)) +
   geom_jitter(width = 0.2, alpha = 0.4, show.legend = FALSE) +
-  stat_summary(fun = median, geom = "point", size = 2, colour = "black") +
-  facet_wrap(~horizon, scales = "free_y") + theme_bw() +
+  geom_boxplot(aes(fill=model)) +
+  facet_grid(data_role~horizon, scales = "free_y") + theme_bw() +
   labs(title = "RMSE by Horizon", y = "RMSE") +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-# 3. Holdout Predictions
-if(nrow(final_preds) > 0) {
-  final_preds %>%
+# 3. Assessment + Holdout Predictions (timeline)
+if(nrow(final_holdout_preds) + nrow(final_assessment_preds) > 0) {
+  actual_series <- df_master %>%
+    arrange(.data[[cfg_time_col]]) %>%
+    select(all_of(cfg_time_col), actual = all_of(cfg_outcome_col)) %>%
+    distinct()
+
+  prediction_plot_data <- bind_rows(final_assessment_preds, final_holdout_preds) %>%
+    mutate(Sample_Date1 = Sample_Date+horizon,
+           horizon = factor(horizon))
+
+  prediction_plot_data %>%
     ggplot() +
-    geom_line(aes(x = !!sym(cfg_time_col), y = .y_target, group = interaction(horizon, !!sym(cfg_id_col))), colour = "black", linewidth = 0.8) +
-    geom_line(aes(x = !!sym(cfg_time_col), y = .pred, colour = model, group = interaction(model, horizon)), alpha = 0.7) +
-    facet_wrap(~horizon, scales = "free_y") + theme_minimal() +
-    labs(title = "Holdout Predictions", y = "Outcome")
+    geom_line(data = actual_series, aes(x = Sample_Date, y = actual), colour = "black", linewidth = 0.8) +
+    geom_point(data = actual_series, aes(x = Sample_Date, y = actual), colour = "black", alpha = 0.4, size = 1) +
+    geom_point(aes(x = Sample_Date1, y = .pred, colour = model, shape = horizon, alpha = data_role), size = 2) +
+    theme_minimal(base_size = 13) +
+    scale_alpha_manual(values = c(assessment = 0.5, holdout = 1), name = "Data Role") +
+    labs(title = "Assessment & Holdout Predictions", y = "Outcome", x = cfg_time_col, colour = "Model", shape = "Horizon")
 }
